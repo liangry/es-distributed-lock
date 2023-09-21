@@ -1,6 +1,6 @@
-module github.com/graup/es-distributed-lock
+module github.com/liangry/es-distributed-lock
 
-go 1.13
+go 1.20
 
 require (
 	github.com/bytedance/sonic v1.10.1 // indirect
