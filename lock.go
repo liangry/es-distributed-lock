@@ -2,18 +2,24 @@ package lock
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
+	"net/http"
 	"sync"
 	"time"
 
+	"github.com/bytedance/sonic"
+	"github.com/elastic/go-elasticsearch/v8"
+	"github.com/elastic/go-elasticsearch/v8/esapi"
+	"github.com/elastic/go-elasticsearch/v8/esutil"
 	"github.com/google/uuid"
-	"github.com/olivere/elastic"
 )
 
 // Lock implements a distributed lock using Elasticsearch.
 // The use case of this lock is improving efficiency (not correctness)
 type Lock struct {
-	client          *elastic.Client
+	client          *elasticsearch.Client
 	indexName       string
 	typeName        string
 	lastTTL         time.Duration
@@ -32,7 +38,7 @@ var (
 )
 
 // NewLock create a new lock identified by a string
-func NewLock(client *elastic.Client, id string) *Lock {
+func NewLock(client *elasticsearch.Client, id string) *Lock {
 	return &Lock{
 		client:          client,
 		ID:              id,
@@ -63,7 +69,7 @@ func (lock *Lock) Acquire(ctx context.Context, ttl time.Duration) error {
 	lock.Expires = lock.Acquired.Add(ttl)
 	// This script ensures that the owner is the same so that a single process can renew a named lock over again.
 	// In case the lock is expired, another process can take over.
-	script := elastic.NewScript(`
+	script := `
 	if (ctx._source.owner != params.owner && ZonedDateTime.parse(ctx._source.expires).isAfter(ZonedDateTime.parse(params.now))) {
 		ctx.op = "none";
 	} else {
@@ -73,20 +79,47 @@ func (lock *Lock) Acquire(ctx context.Context, ttl time.Duration) error {
 			ctx._source.acquired = params.acquired;
 		}
 	}
-	`)
-	script.Params(map[string]interface{}{
+	`
+	params := map[string]interface{}{
 		"now":      time.Now(),
 		"owner":    lock.Owner,
 		"expires":  lock.Expires,
 		"acquired": lock.Acquired,
-	})
-	resp, err := lock.client.Update().Index(lock.indexName).Type(lock.typeName).Id(lock.ID).Script(script).Upsert(lock).Refresh("true").ScriptedUpsert(true).Do(ctx)
-	if elastic.IsConflict(err) || err == nil && resp.Result == "noop" {
-		return fmt.Errorf("lock held by other client")
 	}
+
+	req := esapi.UpdateRequest{
+		Index:      lock.indexName,
+		DocumentID: lock.ID,
+		Refresh:    "true",
+		Body: esutil.NewJSONReader(map[string]interface{}{
+			"script": map[string]interface{}{
+				"source": script,
+				"lang":   "painless",
+				"params": params,
+			},
+			"upsert": map[string]interface{}{
+				"owner":    lock.Owner,
+				"expires":  lock.Expires,
+				"acquired": lock.Acquired,
+			},
+		}),
+	}
+
+	res, err := req.Do(ctx, lock.client)
 	if err != nil {
 		return err
 	}
+	if res.StatusCode == http.StatusConflict {
+		return fmt.Errorf("lock held by other client")
+	}
+	obj, err := parseResultObject(res)
+	if err != nil {
+		return err
+	}
+	if obj["result"] == "noop" {
+		return fmt.Errorf("lock held by other client")
+	}
+
 	lock.isAcquired = true
 	lock.isReleased = false
 	return nil
@@ -138,18 +171,43 @@ func (lock *Lock) release(errorIfNoop bool) error {
 		return nil
 	}
 	ctx := context.Background()
-	// Query checking that lock is still held by this client
-	query := elastic.NewBoolQuery().Must(
-		elastic.NewTermQuery("_id", lock.ID),
-		elastic.NewTermQuery("owner.keyword", lock.Owner), // Without .keyword, this fails at matching analyzed strings (e.g. containing hyphens or spaces)
-	)
-	resp, err := lock.client.DeleteByQuery().Index(lock.indexName).Query(query).Refresh("true").Conflicts("proceed").Do(ctx)
+	refresh := true
+	req := esapi.DeleteByQueryRequest{
+		Index:     []string{lock.indexName},
+		Refresh:   &refresh,
+		Conflicts: "proceed",
+		Body: esutil.NewJSONReader(map[string]interface{}{
+			"query": map[string]interface{}{
+				"bool": map[string]interface{}{
+					"must": []map[string]interface{}{
+						{
+							"term": map[string]interface{}{
+								"_id": lock.ID,
+							},
+						},
+						{
+							"term": map[string]interface{}{
+								"owner.keyword": lock.Owner,
+							},
+						},
+					},
+				},
+			},
+		}),
+	}
+
+	res, err := req.Do(ctx, lock.client)
 	if err != nil {
 		return err
 	}
 	lock.isReleased = true
 	lock.isAcquired = false
-	if errorIfNoop && resp.Deleted == 0 {
+	obj, err := parseResultObject(res)
+	if err != nil {
+		return err
+	}
+	deleted := int(obj["deleted"].(float64))
+	if errorIfNoop && deleted == 0 {
 		return fmt.Errorf("release had no effect (lock: %v, client: %v)", lock.ID, lock.Owner)
 	}
 	return nil
@@ -178,4 +236,35 @@ func (lock *Lock) IsReleased() bool {
 	lock.mutex.Lock()
 	defer lock.mutex.Unlock()
 	return lock.isReleased || lock.Expires.Before(time.Now())
+}
+
+func parseResultObject(res *esapi.Response) (map[string]interface{}, error) {
+	body, err := io.ReadAll(res.Body)
+	if err != nil {
+		return nil, err
+	}
+	var result map[string]interface{}
+	err = sonic.Unmarshal(body, &result)
+	if err != nil {
+		return nil, err
+	}
+	if result["error"] != nil {
+		var obj struct {
+			Error struct {
+				Reason    string `json:"reason"`
+				RootCause []struct {
+					Reason string `json:"reason"`
+				} `json:"root_cause"`
+			} `json:"error"`
+		}
+		sonic.Unmarshal(body, &obj)
+		reason := obj.Error.Reason
+		if len(obj.Error.RootCause) == 0 {
+			return nil, errors.New(result["error"].(string))
+		}
+		rootCause := obj.Error.RootCause[0].Reason
+		message := fmt.Sprintf("%s: %s", reason, rootCause)
+		return nil, errors.New(message)
+	}
+	return result, nil
 }

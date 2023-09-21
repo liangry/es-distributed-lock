@@ -9,24 +9,29 @@ import (
 	"testing"
 	"time"
 
-	"github.com/olivere/elastic"
+	"github.com/elastic/go-elasticsearch/v8"
 )
 
-func NewElasticClient(esURL string) (*elastic.Client, error) {
+func NewElasticClient(esURL string) (*elasticsearch.Client, error) {
 	url := esURL
 	if !strings.HasPrefix(url, "http") {
 		url = fmt.Sprintf("http://%s", url)
 	}
-	tr := &http.Transport{
-		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+	httpTransport := &http.Transport{
+		TLSClientConfig:       &tls.Config{InsecureSkipVerify: true},
+		MaxIdleConnsPerHost:   10,
+		ResponseHeaderTimeout: 10 * time.Second,
 	}
-	httpClient := &http.Client{Transport: tr}
-	client, err := elastic.NewClient(
-		elastic.SetHttpClient(httpClient),
-		elastic.SetURL(url),
-		elastic.SetHealthcheckTimeoutStartup(10*time.Second),
-		elastic.SetSniff(false),
-	)
+	httpClient := &http.Client{
+		Transport: httpTransport,
+	}
+	cfg := elasticsearch.Config{
+		Addresses: []string{url},
+		Username:  "elastic",
+		Password:  "",
+		Transport: httpClient.Transport,
+	}
+	client, err := elasticsearch.NewClient(cfg)
 	if err != nil {
 		return nil, err
 	}
